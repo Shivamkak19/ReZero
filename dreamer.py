@@ -15,6 +15,7 @@ import tools
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
+from stu_dynamics import STUDeterPredictor, MiniSTU, make_filters
 
 
 class Dreamer(nn.Module):
@@ -42,6 +43,52 @@ class Dreamer(nn.Module):
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
+        # Optional STU side network for auxiliary multi-step training loss.
+        # Constructed only when config.stu_dec.enabled is True. Trained
+        # alongside the regular RSSM via an extra MSE consistency loss
+        # against the posterior deterministic state trajectory. Never
+        # queried in the imagination loop or by the actor — only at
+        # training time. Mirrors the EZv2 STUDecoder-aux integration.
+        self.use_stu_dec_aux = bool(config.get('stu_dec', {}).get('enabled', False))
+        self.stu_dec = None
+        if self.use_stu_dec_aux:
+            stu_cfg = config.stu_dec
+            self.stu_dec = STUDeterPredictor(
+                deter_dim=int(self.rssm._deter),
+                action_space_size=int(self.act_dim),
+                action_dim=int(self.act_dim),    # Atari one-hot is stored as continuous-shape
+                max_action_seq_len=int(stu_cfg.get('max_action_seq_len', 64)),
+                d_model=int(stu_cfg.get('d_model', 128)),
+                num_stu_layers=int(stu_cfg.get('num_layers', 4)),
+                num_filters=int(stu_cfg.get('num_filters', 8)),
+                mlp_ratio=float(stu_cfg.get('mlp_ratio', 2.0)),
+                use_hankel_L=False,
+                is_continuous=True,              # Dreamer stores one-hot actions as float vectors
+            )
+            # Optionally swap MiniSTU.phi to a different filter basis (e.g., hankel_scaled).
+            stu_filter_type = str(stu_cfg.get('filter_type', 'hankel'))
+            if stu_filter_type != 'hankel':
+                stu_modules = [m for m in self.stu_dec.modules() if isinstance(m, MiniSTU)]
+                for idx, mod in enumerate(stu_modules):
+                    seq_len = mod.phi.shape[0]
+                    K_filt = mod.phi.shape[1]
+                    new_phi = make_filters(
+                        kind=stu_filter_type,
+                        seq_len=seq_len, num_filters=K_filt,
+                        seed=int(config.device.split(':')[-1] if isinstance(config.device, str) and ':' in config.device else 0) + idx,
+                    )
+                    with torch.no_grad():
+                        mod.phi.copy_(new_phi.to(device=mod.phi.device, dtype=mod.phi.dtype))
+                print(f"STUDeterPredictor filter swap: filter_type={stu_filter_type}, "
+                      f"swapped {len(stu_modules)} MiniSTU instances")
+            n_stu_params = sum(p.numel() for p in self.stu_dec.parameters() if p.requires_grad)
+            print(f"STUDeterPredictor aux constructed: max_action_seq_len="
+                  f"{stu_cfg.get('max_action_seq_len', 64)}, d_model="
+                  f"{stu_cfg.get('d_model', 128)}, num_layers={stu_cfg.get('num_layers', 4)}, "
+                  f"num_filters={stu_cfg.get('num_filters', 8)}, "
+                  f"filter_type={stu_filter_type}, params={n_stu_params:,}")
+            self.stu_dec_loss_coeff = float(stu_cfg.get('loss_coeff', 1.0))
+
         config.actor.shape = (act_space.n,) if hasattr(act_space, "n") else tuple(map(int, act_space.shape))
         self.act_discrete = False
         if hasattr(act_space, "multi_discrete"):
@@ -64,6 +111,9 @@ class Dreamer(nn.Module):
         self._slow_value_updates = 0
 
         self._loss_scales = dict(config.loss_scales)
+        # Make sure the optional STUDeterPredictor aux loss has a coefficient.
+        if 'stu_dec' not in self._loss_scales:
+            self._loss_scales['stu_dec'] = 1.0
         self._log_grads = bool(config.log_grads)
 
         modules = {
@@ -74,6 +124,8 @@ class Dreamer(nn.Module):
             "cont": self.cont,
             "encoder": self.encoder,
         }
+        if self.stu_dec is not None:
+            modules["stu_dec"] = self.stu_dec
 
         if self.rep_loss == "dreamer":
             self.decoder = networks.MultiDecoder(
@@ -425,6 +477,23 @@ class Dreamer(nn.Module):
             losses.update(proto_losses)
         else:
             raise NotImplementedError
+
+        # === STUDeterPredictor auxiliary multi-step loss ===
+        # Predict the entire posterior deterministic trajectory in a single
+        # forward pass from the initial deter state and the action sequence.
+        # Train against the (detached) posterior deter trajectory from the
+        # standard RSSM rollout above. Encoder gradients flow back via the
+        # initial-state input. The standard RSSM is unaffected.
+        if self.stu_dec is not None:
+            # post_deter: [B, T, D]; we predict positions 1..T-1 from position 0.
+            init_deter = post_deter[:, 0]                                    # [B, D]
+            # data["action"]: [B, T, A]; the action that takes us from deter[t-1] to deter[t]
+            # is action[t]; so to predict deter[1..T-1] we use actions[1..T-1].
+            stu_actions = data["action"][:, 1:].float()                      # [B, T-1, A]
+            stu_target = post_deter[:, 1:].detach()                          # [B, T-1, D]
+            # Forward
+            stu_pred = self.stu_dec(init_deter, stu_actions)                 # [B, T-1, D]
+            losses["stu_dec"] = F.mse_loss(stu_pred, stu_target)
 
         # reward and continue
         losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))

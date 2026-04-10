@@ -32,6 +32,23 @@ loss_scales:
   swav: 1.0
   temp: 1.0
   norm: 1.0
+  stu_dec: 1.0      # weight for the STUDeterPredictor auxiliary multi-step MSE loss
+
+# STUDeterPredictor auxiliary multi-step training loss.
+# When stu_dec.enabled is True, a side network trained alongside RSSM
+# predicts the deterministic-state trajectory in one shot from
+# (initial_deter, action_sequence). Trained against the posterior deter
+# trajectory from the standard RSSM rollout. Never queried in the
+# imagination loop. Mirrors the EZv2 STUDecoder-aux integration.
+stu_dec:
+  enabled: false
+  d_model: 128
+  num_layers: 4
+  num_filters: 8
+  mlp_ratio: 2.0
+  max_action_seq_len: 64    # must be >= batch_length-1
+  filter_type: hankel       # hankel | random | random_normalized | dct | dft | hankel_scaled
+  loss_coeff: 1.0
 
 r2dreamer:
   lambd: 5e-4
