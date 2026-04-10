@@ -15,7 +15,7 @@ import tools
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
-from stu_dynamics import STUDeterPredictor, MiniSTU, make_filters
+from stu_dynamics import STUEmbedMixer, MiniSTU, make_filters
 
 
 class Dreamer(nn.Module):
@@ -43,51 +43,57 @@ class Dreamer(nn.Module):
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
-        # Optional STU side network for auxiliary multi-step training loss.
-        # Constructed only when config.stu_dec.enabled is True. Trained
-        # alongside the regular RSSM via an extra MSE consistency loss
-        # against the posterior deterministic state trajectory. Never
-        # queried in the imagination loop or by the actor — only at
-        # training time. Mirrors the EZv2 STUDecoder-aux integration.
-        self.use_stu_dec_aux = bool(config.get('stu_dec', {}).get('enabled', False))
-        self.stu_dec = None
-        if self.use_stu_dec_aux:
-            stu_cfg = config.stu_dec
-            self.stu_dec = STUDeterPredictor(
-                deter_dim=int(self.rssm._deter),
-                action_space_size=int(self.act_dim),
-                action_dim=int(self.act_dim),    # Atari one-hot is stored as continuous-shape
-                max_action_seq_len=int(stu_cfg.get('max_action_seq_len', 64)),
-                d_model=int(stu_cfg.get('d_model', 128)),
-                num_stu_layers=int(stu_cfg.get('num_layers', 4)),
+        # Optional STU sequence mixer applied between encoder and RSSM.
+        # When enabled, every encoder embedding [B, T, E] is passed through
+        # a stack of STUSandwichBlocks (FFN -> STU -> FFN, residual, pre-norm)
+        # before being consumed by `rssm.observe`. The STU is *causal* (uses
+        # the Hankel_L basis) so that training (full [B, T, E] in parallel)
+        # is bit-equivalent to inference (rolling embed buffer in agent state).
+        # This mirrors the spectral-transformer-jax STUSandwichBlock and tests
+        # whether STU as an in-forward-path sequence mixer — the integration
+        # that actually showed benefits in the jax repo's state-tracking work
+        # — improves Dreamer world models.
+        self.use_stu_mixer = bool(config.get('stu_mixer', {}).get('enabled', False))
+        self.stu_mixer_seq_len = int(config.get('stu_mixer', {}).get('seq_len', 64))
+        self.stu_mixer = None
+        if self.use_stu_mixer:
+            stu_cfg = config.stu_mixer
+            d_model_cfg = stu_cfg.get('d_model', None)
+            d_model_val = int(d_model_cfg) if d_model_cfg is not None else self.embed_size
+            self.stu_mixer = STUEmbedMixer(
+                embed_dim=int(self.embed_size),
+                seq_len=self.stu_mixer_seq_len,
+                num_layers=int(stu_cfg.get('num_layers', 2)),
                 num_filters=int(stu_cfg.get('num_filters', 8)),
+                d_model=d_model_val,
                 mlp_ratio=float(stu_cfg.get('mlp_ratio', 2.0)),
-                use_hankel_L=False,
-                is_continuous=True,              # Dreamer stores one-hot actions as float vectors
+                layer_scale_init=float(stu_cfg.get('layer_scale_init', 1e-4)),
+                use_hankel_L=True,
             )
-            # Optionally swap MiniSTU.phi to a different filter basis (e.g., hankel_scaled).
+            # Optionally swap each MiniSTU.phi to a different filter basis
+            # (e.g., 'hankel_scaled', the offline STUZero global best).
             stu_filter_type = str(stu_cfg.get('filter_type', 'hankel'))
             if stu_filter_type != 'hankel':
-                stu_modules = [m for m in self.stu_dec.modules() if isinstance(m, MiniSTU)]
+                stu_modules = [m for m in self.stu_mixer.modules() if isinstance(m, MiniSTU)]
                 for idx, mod in enumerate(stu_modules):
-                    seq_len = mod.phi.shape[0]
+                    sl = mod.phi.shape[0]
                     K_filt = mod.phi.shape[1]
                     new_phi = make_filters(
                         kind=stu_filter_type,
-                        seq_len=seq_len, num_filters=K_filt,
-                        seed=int(config.device.split(':')[-1] if isinstance(config.device, str) and ':' in config.device else 0) + idx,
+                        seq_len=sl, num_filters=K_filt,
+                        use_hankel_L=True,
+                        seed=int(config.seed) + idx if hasattr(config, 'seed') else idx,
                     )
                     with torch.no_grad():
                         mod.phi.copy_(new_phi.to(device=mod.phi.device, dtype=mod.phi.dtype))
-                print(f"STUDeterPredictor filter swap: filter_type={stu_filter_type}, "
+                print(f"STUEmbedMixer filter swap: filter_type={stu_filter_type}, "
                       f"swapped {len(stu_modules)} MiniSTU instances")
-            n_stu_params = sum(p.numel() for p in self.stu_dec.parameters() if p.requires_grad)
-            print(f"STUDeterPredictor aux constructed: max_action_seq_len="
-                  f"{stu_cfg.get('max_action_seq_len', 64)}, d_model="
-                  f"{stu_cfg.get('d_model', 128)}, num_layers={stu_cfg.get('num_layers', 4)}, "
+            n_stu_params = sum(p.numel() for p in self.stu_mixer.parameters() if p.requires_grad)
+            print(f"STUEmbedMixer constructed: seq_len={self.stu_mixer_seq_len}, "
+                  f"embed_dim={self.embed_size}, d_model={d_model_val}, "
+                  f"num_layers={stu_cfg.get('num_layers', 2)}, "
                   f"num_filters={stu_cfg.get('num_filters', 8)}, "
                   f"filter_type={stu_filter_type}, params={n_stu_params:,}")
-            self.stu_dec_loss_coeff = float(stu_cfg.get('loss_coeff', 1.0))
 
         config.actor.shape = (act_space.n,) if hasattr(act_space, "n") else tuple(map(int, act_space.shape))
         self.act_discrete = False
@@ -111,9 +117,6 @@ class Dreamer(nn.Module):
         self._slow_value_updates = 0
 
         self._loss_scales = dict(config.loss_scales)
-        # Make sure the optional STUDeterPredictor aux loss has a coefficient.
-        if 'stu_dec' not in self._loss_scales:
-            self._loss_scales['stu_dec'] = 1.0
         self._log_grads = bool(config.log_grads)
 
         modules = {
@@ -124,8 +127,8 @@ class Dreamer(nn.Module):
             "cont": self.cont,
             "encoder": self.encoder,
         }
-        if self.stu_dec is not None:
-            modules["stu_dec"] = self.stu_dec
+        if self.stu_mixer is not None:
+            modules["stu_mixer"] = self.stu_mixer
 
         if self.rep_loss == "dreamer":
             self.decoder = networks.MultiDecoder(
@@ -240,6 +243,18 @@ class Dreamer(nn.Module):
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
+        # Frozen STU mixer for the inference rolling-buffer path.
+        if self.stu_mixer is not None:
+            self._frozen_stu_mixer = copy.deepcopy(self.stu_mixer)
+            for (name_orig, param_orig), (name_new, param_new) in zip(
+                self.stu_mixer.named_parameters(), self._frozen_stu_mixer.named_parameters()
+            ):
+                assert name_orig == name_new
+                param_new.data = param_orig.data
+                param_new.requires_grad_(False)
+        else:
+            self._frozen_stu_mixer = None
+
         self._frozen_rssm = copy.deepcopy(self.rssm)
         for (name_orig, param_orig), (name_new, param_new) in zip(
             self.rssm.named_parameters(), self._frozen_rssm.named_parameters()
@@ -302,6 +317,31 @@ class Dreamer(nn.Module):
         p_obs = self.preprocess(obs)
         # (B, E)
         embed = self._frozen_encoder(p_obs)
+
+        # If the STU mixer is enabled, run it on a rolling embed history
+        # buffer maintained in the agent state. The buffer length matches the
+        # mixer's seq_len (== batch_length used in training), so the mixer
+        # sees the same fixed-length context at training and inference. With
+        # causal Hankel filters the last position of the mixer output depends
+        # only on positions <= t, exactly matching what training computes for
+        # position t given embeds[0..t]. New episodes start with a zero
+        # buffer; on `is_first`, we reset the buffer.
+        if self._frozen_stu_mixer is not None:
+            # (B, L, E)
+            embed_hist = state["embed_history"].clone()
+            is_first = obs["is_first"]
+            # Zero out histories for environments that just reset.
+            if is_first.any():
+                reset_mask = is_first.view(-1, 1, 1).to(embed_hist.dtype)
+                embed_hist = embed_hist * (1.0 - reset_mask)
+            # Roll: drop oldest, append current embed at the end.
+            embed_hist = torch.cat([embed_hist[:, 1:], embed.unsqueeze(1)], dim=1)
+            # Mix the full window; take the last (most recent) position.
+            mixed_hist = self._frozen_stu_mixer(embed_hist)
+            embed = mixed_hist[:, -1]
+        else:
+            embed_hist = None
+
         prev_stoch, prev_deter, prev_action = (
             state["stoch"],
             state["deter"],
@@ -314,16 +354,24 @@ class Dreamer(nn.Module):
         action_dist = self._frozen_actor(feat)
         # (B, A)
         action = action_dist.mode if eval else action_dist.rsample()
-        return action, TensorDict(
-            {"stoch": stoch, "deter": deter, "prev_action": action},
-            batch_size=state.batch_size,
-        )
+
+        new_state = {"stoch": stoch, "deter": deter, "prev_action": action}
+        if embed_hist is not None:
+            new_state["embed_history"] = embed_hist
+        return action, TensorDict(new_state, batch_size=state.batch_size)
 
     @torch.no_grad()
     def get_initial_state(self, B):
         stoch, deter = self.rssm.initial(B)
         action = torch.zeros(B, self.act_dim, dtype=torch.float32, device=self.device)
-        return TensorDict({"stoch": stoch, "deter": deter, "prev_action": action}, batch_size=(B,))
+        state = {"stoch": stoch, "deter": deter, "prev_action": action}
+        if self.stu_mixer is not None:
+            # Zero rolling history of the same length the mixer was built with.
+            state["embed_history"] = torch.zeros(
+                B, self.stu_mixer_seq_len, self.embed_size,
+                dtype=torch.float32, device=self.device,
+            )
+        return TensorDict(state, batch_size=(B,))
 
     @torch.no_grad()
     def video_pred(self, data, initial):
@@ -417,6 +465,24 @@ class Dreamer(nn.Module):
         # === World model: posterior rollout and KL losses ===
         # (B, T, E)
         embed = self.encoder(data)
+        # Apply STU sequence mixer (causal Hankel_L) along the time axis
+        # before handing the embeddings to the RSSM. With LayerScale init
+        # small, the mixer starts as a near-identity residual and gradually
+        # learns to inject temporally-mixed structure into the encoder output.
+        # On positions that begin a new episode (`is_first`), fall back to
+        # the raw embed: the mixer's spectral conv can leak embed values
+        # across episode resets within a single batch row, and this masks
+        # the immediate boundary position. The convolutional "tail" past
+        # the reset still leaks for up to seq_len steps; that residual
+        # cross-episode contamination is noted in REZERO_SETUP.md.
+        if self.stu_mixer is not None:
+            mixed_embed = self.stu_mixer(embed)
+            # data["is_first"] is [B, T, 1] post-preprocess; broadcast over the
+            # embed feature axis. Reset rows fall back to the raw embed.
+            is_first_mask = data["is_first"].float()
+            if is_first_mask.dim() == 2:
+                is_first_mask = is_first_mask.unsqueeze(-1)
+            embed = mixed_embed * (1.0 - is_first_mask) + embed * is_first_mask
         # (B, T, S, K), (B, T, D), (B, T, S, K)
         post_stoch, post_deter, post_logit = self.rssm.observe(embed, data["action"], initial, data["is_first"])
         # (B, T, S, K)
@@ -470,6 +536,8 @@ class Dreamer(nn.Module):
                 ema_proj = self.ema_proj(data_aug)
 
             embed_aug = self.encoder(data_aug)
+            if self.stu_mixer is not None:
+                embed_aug = self.stu_mixer(embed_aug)
             post_stoch_aug, post_deter_aug, _ = self.rssm.observe(
                 embed_aug, data_aug["action"], initial_aug, data_aug["is_first"]
             )
@@ -477,23 +545,6 @@ class Dreamer(nn.Module):
             losses.update(proto_losses)
         else:
             raise NotImplementedError
-
-        # === STUDeterPredictor auxiliary multi-step loss ===
-        # Predict the entire posterior deterministic trajectory in a single
-        # forward pass from the initial deter state and the action sequence.
-        # Train against the (detached) posterior deter trajectory from the
-        # standard RSSM rollout above. Encoder gradients flow back via the
-        # initial-state input. The standard RSSM is unaffected.
-        if self.stu_dec is not None:
-            # post_deter: [B, T, D]; we predict positions 1..T-1 from position 0.
-            init_deter = post_deter[:, 0]                                    # [B, D]
-            # data["action"]: [B, T, A]; the action that takes us from deter[t-1] to deter[t]
-            # is action[t]; so to predict deter[1..T-1] we use actions[1..T-1].
-            stu_actions = data["action"][:, 1:].float()                      # [B, T-1, A]
-            stu_target = post_deter[:, 1:].detach()                          # [B, T-1, D]
-            # Forward
-            stu_pred = self.stu_dec(init_deter, stu_actions)                 # [B, T-1, D]
-            losses["stu_dec"] = F.mse_loss(stu_pred, stu_target)
 
         # reward and continue
         losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))

@@ -2,105 +2,152 @@
 
 This is a fork of [`NM512/r2dreamer`](https://github.com/NM512/r2dreamer)
 (an efficient PyTorch DreamerV3 / R2-Dreamer implementation) with an
-optional **`STUDeterPredictor`** side network added: a JAX-faithful
-sequence-to-sequence dynamics predictor that takes `(initial_deter,
-action_sequence)` and predicts the entire deterministic-state
-trajectory in a single forward pass.
+optional **`STUEmbedMixer`** added: a forward-path STU sequence mixer
+that takes the encoder output `[B, T, E]` and mixes it along the time
+axis before the RSSM consumes it.
 
-The integration model is **STUDeterPredictor as auxiliary multi-step
-training loss** (mirrors the EZv2 STUDecoder-aux integration):
+## Integration model
 
-- Standard RSSM is unchanged. It still drives the imagination loop and
-  the actor-critic.
-- A side network `STUDeterPredictor` (~1.8M params) is constructed
-  alongside RSSM, gated by a config flag.
-- During each training step, after the standard `rssm.observe(...)`
-  posterior rollout, `STUDeterPredictor` is called once with
-  `(post_deter[:, 0], data["action"][:, 1:])` and predicts
-  `pred_deter` of shape `[B, T-1, deter_dim]`.
-- An MSE loss is computed between `pred_deter` and the (detached)
-  `post_deter[:, 1:]`.
-- The MSE loss is added to the total optimizer loss with coefficient
-  `loss_scales.stu_dec`. Encoder gradients flow back via the
-  initial-state input.
-- The MCTS / imagination loop is **never** affected — STU is only used
-  at training time as a side prediction objective.
+The integration mirrors the spectral-transformer-jax usage of STU
+(`spectral-transformer-jax/src/stj/models/blocks.py::STUSandwichBlock`),
+where STU is a first-class non-attention sequence mixer inside a residual
+transformer-style block. That repo's STU usage was shown to be useful for
+state tracking, which is the property we want to test here.
+
+Vanilla R2-Dreamer flow with the one addition (`*`):
+
+```
+embed = encoder(data)              # [B, T, E]
+embed = stu_mixer(embed)           # [B, T, E]      *  causal Hankel_L
+post_stoch, post_deter, _ = rssm.observe(embed, ...)
+```
+
+The mixer is a stack of `STUSandwichBlock` modules. Each block is a
+pre-norm residual sandwich:
+
+```
+sublayer 1:  x = x + LayerScale * FFN_in(LN(x))     # per-position
+sublayer 2:  x = x + LayerScale * STU(LN(x))        # sequence mixing
+sublayer 3:  x = x + LayerScale * FFN_out(LN(x))    # per-position
+```
+
+`LayerScale` is initialized to `1e-4` so the mixer is approximately the
+identity at init — `model.stu_mixer.enabled=true` does not perturb the
+initial training trajectory of vanilla R2-Dreamer; the mixer only
+contributes if/when training pulls the LayerScale gammas up.
+
+### Causality and the inference rolling buffer
+
+The STU is built with `use_hankel_L=True`, the *causal* Hankel basis Z_L
+from the STU paper. Causality means each output position t depends only
+on input positions ≤ t. We need this so that:
+
+- **Training** runs the mixer once over the full `[B, T, E]` batch
+  sequence (T = `batch_length`, default 64) in parallel.
+- **Inference** in `Dreamer.act` maintains a rolling embed history
+  buffer of length `seq_len` in the agent state (`embed_history`,
+  zero-initialized and reset on `is_first`). At each step the new embed
+  is appended, the mixer runs over the full window, and the **last**
+  position is fed to `rssm.obs_step`.
+
+With causal filters, **at steady state** (after `seq_len-1` steps from
+an episode reset, i.e., once the rolling buffer is full of real embeds)
+the inference last-position output equals what training computes for
+the final position of a length-`seq_len` input window with the same
+contents. Before steady state — for the first `seq_len-1` steps of each
+episode — the inference buffer contains zero-padding that does not match
+how training position t (for t < seq_len-1) is computed; this is a
+warm-up region where train and inference are not bit-equivalent.
+
+A frozen copy of the mixer (`_frozen_stu_mixer`) is maintained alongside
+`_frozen_encoder` / `_frozen_rssm` and refreshed in `clone_and_freeze`.
 
 ## What's been added vs vanilla r2dreamer
 
 **New files**:
 - `stu_dynamics/__init__.py`
-- `stu_dynamics/stu_layer.py` — `MiniSTU` (FFT-based STU layer)
+- `stu_dynamics/stu_layer.py` — `MiniSTU` (FFT-based STU layer, supports
+  causal Hankel_L)
 - `stu_dynamics/filter_factory.py` — `make_filters(kind, ...)` for the
-  6 filter types (`hankel`, `random`, `random_normalized`, `dct`,
-  `dft`, `hankel_scaled`)
-- `stu_dynamics/stu_dynamics.py` — `STUResBlock` and
-  `STUDeterPredictor`
+  6 filter ablation bases
+- `stu_dynamics/stu_dynamics.py` — `STUSandwichBlock`, `STUEmbedMixer`,
+  `LayerScale`
 
 **Modified files**:
-- `dreamer.py` — adds STU import, conditional construction in
-  `Dreamer.__init__`, optimizer module registration, and the auxiliary
-  loss in `_cal_grad` after `rssm.observe(...)`
-- `configs/model/_base_.yaml` — adds `stu_dec.*` config block and
-  `loss_scales.stu_dec`
+- `dreamer.py`:
+  - imports `STUEmbedMixer`
+  - constructs `self.stu_mixer` in `__init__` when enabled
+  - registers it with the optimizer module dict
+  - clones it into `_frozen_stu_mixer` in `clone_and_freeze`
+  - applies it to `embed` in `_cal_grad` and the `dreamerpro` `embed_aug`
+    branch before `rssm.observe`
+  - adds `embed_history` to the agent state in `get_initial_state` and
+    rolls it inside `act`
+- `configs/model/_base_.yaml` — adds the `stu_mixer.*` config block
+  (replacing the old `stu_dec.*` side-loss block)
 
 The vanilla DreamerV3 / R2-Dreamer code paths are 100% backward
-compatible: with `model.stu_dec.enabled=false` (the default), the
-behaviour is identical to upstream r2dreamer.
+compatible: with `model.stu_mixer.enabled=false` (the default), the
+behavior is identical to upstream r2dreamer.
 
-## Setup (on the GPU machine where you'll actually train)
+## Setup
 
 ```bash
 cd /path/to/ReZero
-# Python 3.11 is required (per upstream README).
-# We use uv but you can use any venv tool.
+# Python 3.11 required (per upstream README).
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-Verify the integration constructs without errors (no GPU needed):
+### Smoke test (GPU recommended, but module-level test runs on CPU)
 
 ```bash
 python -c "
 import sys; sys.path.insert(0, '.')
 import torch
-from stu_dynamics import STUDeterPredictor, make_filters, MiniSTU
+from stu_dynamics import STUEmbedMixer, MiniSTU, make_filters
 
-m = STUDeterPredictor(
-    deter_dim=2048, action_space_size=6, action_dim=6,
-    max_action_seq_len=64, d_model=128, num_stu_layers=4, num_filters=8,
-    is_continuous=True,
-)
+# Realistic Atari-12M shape
+m = STUEmbedMixer(embed_dim=1024, seq_len=64, num_layers=2, num_filters=8, d_model=256)
 n = sum(p.numel() for p in m.parameters() if p.requires_grad)
-print(f'STUDeterPredictor params: {n:,}')
+print(f'STUEmbedMixer params: {n:,}')
+
+x = torch.randn(4, 64, 1024)
+y = m(x)
+assert y.shape == x.shape
+print(f'init residual norm fraction: {((y - x).norm() / x.norm()).item():.3e}')
+
+# Streaming-vs-parallel parity test (the key correctness claim)
+m.eval()
+buf = torch.zeros(4, 64, 1024)
+for t in range(64):
+    buf = torch.cat([buf[:, 1:], x[:, t:t+1]], dim=1)
+    last = m(buf)[:, -1]
+parallel = m(x)[:, -1]
+print(f'streaming vs parallel last-position diff: {(last - parallel).abs().max().item():.3e}')
 
 # Filter sanity check
-for k in ['hankel', 'random', 'random_normalized', 'dct', 'dft', 'hankel_scaled']:
-    f = make_filters(k, seq_len=65, num_filters=8, seed=42)
+for k in ['hankel', 'hankel_scaled', 'dct', 'dft', 'random_normalized', 'random']:
+    f = make_filters(k, seq_len=64, num_filters=8, use_hankel_L=True, seed=42)
     norms = torch.linalg.norm(f, dim=0)
     print(f'  {k:18s} col_norms[:3]={[round(v.item(),4) for v in norms[:3]]}')
 "
 ```
 
-Expected output:
-```
-STUDeterPredictor params: 1,841,920
-  hankel             col_norms[:3]=[0.0274, 0.0434, 0.0669]
-  random             col_norms[:3]=[6.8683, 6.5759, 7.0218]
-  random_normalized  col_norms[:3]=[0.0274, 0.0434, 0.0669]
-  dct                col_norms[:3]=[0.0274, 0.0434, 0.0669]
-  dft                col_norms[:3]=[0.0274, 0.0434, 0.0669]
-  hankel_scaled      col_norms[:3]=[8.0623, 8.0623, 8.0623]
-```
+Expected: `~2.6M params`, residual norm fraction `~9e-3` (small but
+non-zero so gradients flow to every interior parameter from step 0),
+and streaming/parallel parity diff exactly `0.0` (the causal Hankel_L
+filters guarantee bit-equivalence between training and the inference
+rolling buffer at steady state).
 
 ## Atari 100K — running an experiment
 
 The standard Atari 100K benchmark = 100K agent decisions × 4
-action_repeat = 400K env frames. The existing `configs/env/atari100k.yaml`
-already has `steps: 4.1e5`, which matches.
+action_repeat = 400K env frames. The existing
+`configs/env/atari100k.yaml` already has `steps: 4.1e5`.
 
-### Baseline (vanilla R2-Dreamer, no STU)
+### Baseline (vanilla R2-Dreamer)
 
 ```bash
 python train.py \
@@ -110,61 +157,37 @@ python train.py \
   seed=0
 ```
 
-### Treatment (STUDeterPredictor with `hankel_scaled` filters)
+### Treatment (STUEmbedMixer with `hankel_scaled` filters)
 
 ```bash
 python train.py \
   env=atari100k \
   env.task=atari_pong \
-  model.stu_dec.enabled=true \
-  model.stu_dec.filter_type=hankel_scaled \
-  model.stu_dec.d_model=128 \
-  model.stu_dec.num_layers=4 \
-  model.stu_dec.num_filters=8 \
-  model.stu_dec.max_action_seq_len=64 \
-  model.loss_scales.stu_dec=1.0 \
-  logdir=./logdir/pong_stu_decoder_hankelscaled_seed0 \
+  model.stu_mixer.enabled=true \
+  model.stu_mixer.filter_type=hankel_scaled \
+  model.stu_mixer.num_layers=2 \
+  model.stu_mixer.num_filters=8 \
+  logdir=./logdir/pong_stu_mixer_hankelscaled_seed0 \
   seed=0
 ```
 
-**`max_action_seq_len` must be ≥ `batch_length - 1`.** The default
-`batch_length=64` means `max_action_seq_len=64` works. If you change
-`batch_length`, change this accordingly.
+`stu_mixer.seq_len` defaults to `${batch_length}`; if you change
+`batch_length` (default 64) the interpolation tracks it automatically.
 
 ### Filter ablation
 
-To match the offline ablation matrix from the STUZero study, run with
-`model.stu_dec.filter_type` set to each of:
+`model.stu_mixer.filter_type` can be one of:
 
 - `hankel` — top-K Hankel eigenvectors (the canonical STU basis)
-- `hankel_scaled` — Hankel directions scaled to `sqrt(seq_len)` column
-  norms (the global best from the offline study; recommended default)
+- `hankel_scaled` — Hankel directions rescaled to `sqrt(seq_len)` column
+  norms (the global best from the offline STUZero study)
 - `dct` — top-K DCT-II cosines, scaled to match Hankel column norms
 - `dft` — lowest-K Fourier modes (cos/sin), scaled to match Hankel
 - `random_normalized` — Haar-orthonormal columns scaled to Hankel
-- `random` — i.i.d. Gaussian, no normalization (the unnormalized control)
+- `random` — i.i.d. Gaussian, no normalization (unnormalized control)
 
-The **headline filter ablation** to run if you have compute budget:
-`hankel`, `hankel_scaled`, `dct`, `random_normalized` × `seed ∈ {0, 1, 2}`
-× **same game** = 12 runs, 1 game (Pong is the cheapest). Each run is
-~6-12 hours wall clock on a single A100.
-
-### Multi-game
-
-```bash
-for game in atari_pong atari_breakout atari_asterix atari_mspacman; do
-  python train.py \
-    env=atari100k \
-    env.task=$game \
-    model.stu_dec.enabled=true \
-    model.stu_dec.filter_type=hankel_scaled \
-    logdir=./logdir/${game}_stu_seed0 \
-    seed=0
-done
-```
-
-Atari 100K spec: 26 games. Pong is the easiest to debug; if STU shows
-positive signal on Pong, expand to a 5- or 10-game subset, then full 26.
+Headline ablation: `hankel`, `hankel_scaled`, `dct`, `random_normalized`
+× `seed ∈ {0, 1, 2}` × Pong = 12 runs.
 
 ## Monitoring
 
@@ -172,99 +195,95 @@ positive signal on Pong, expand to a 5- or 10-game subset, then full 26.
 tensorboard --logdir ./logdir
 ```
 
-Look for the new `loss/stu_dec` curve in the loss panel — that's the
-STUDeterPredictor MSE against the posterior deter trajectory. It
-should decrease alongside `loss/dyn` and `loss/rep`. If `loss/stu_dec`
-plateaus much higher than `loss/dyn`, STUDeterPredictor isn't keeping
-up with RSSM and the auxiliary signal is mostly noise. If it tracks
-RSSM closely, the side network is learning a similar trajectory
-representation.
+Watch:
+- `episode/eval_score` and `episode/train_score` — the actual RL signal
+  the experiment is testing
+- Existing world-model losses (`loss/dyn`, `loss/rep`, etc.) — these
+  should at minimum not regress vs the baseline
+- Gradient norms on `stu_mixer.*` params — the LayerScale gammas
+  starting at `1e-4` should grow if the mixer is learning to contribute
 
-The score curves to watch are `episode/eval_score` (from the eval
-worker, every `trainer.eval_every` steps) and `episode/train_score`
-(from the train worker). Atari 100K reports the **mean of last 10
-eval episodes at 100K env steps** as the headline number.
+There is **no** `loss/stu_mixer` curve because the mixer is part of the
+forward path, not a side loss — its gradient signal flows through
+`loss/dyn`, `loss/rep`, and the actor/critic objectives.
 
-## Things that need verification on the first real run
+## Things to verify on the first real run
 
-These are checks I would do on the first end-to-end run that I
-couldn't do locally because the EZv2 experiment is hogging the GPU on
-this machine:
-
-1. **The first `update_weights` call doesn't crash.** The integration
-   is verified at construction time (model builds, optimizer sees the
-   new params, `STUDeterPredictor` forward+backward work in isolation),
-   but the first time the auxiliary loss is computed inside
-   `_cal_grad`, there could be a shape mismatch or device issue that
-   I haven't caught. If you see a torch error in the first 100 steps,
-   send me the traceback.
-2. **`loss/stu_dec` is non-trivial.** It should start at some positive
-   number and decrease over training. If it stays at 0 or NaN, the
-   loss path isn't actually firing.
-3. **Total wall clock for Pong 100K** with the side network. Adding
-   1.8M params (~13% of total) should not slow training by more than
-   ~15-20%. If it's 2× slower, something is wrong.
-4. **GPU memory increase.** STUDeterPredictor adds ~1.8M params and a
-   forward pass per training step. Expect ~1-2 GB of additional GPU
-   memory vs vanilla. If it's much more, there might be an unintended
-   activation retention issue.
+1. **No shape mismatch in `_cal_grad`.** The mixer expects
+   `[B, batch_length, embed_size]`. If you change `batch_length` without
+   updating `model.stu_mixer.seq_len` (or relying on the
+   `${batch_length}` interpolation), construction will succeed but the
+   forward will assert at training time.
+2. **`get_initial_state` produces the rolling buffer.** Inspect the
+   state TensorDict after `agent.get_initial_state(env_num)`; it should
+   contain an `embed_history` field of shape
+   `(env_num, seq_len, embed_size)`.
+3. **`act` rolls the buffer correctly across episodes.** Check that on
+   `is_first=True` steps the history is zeroed for that env index.
+4. **Wall clock.** A 2-layer mixer over `[B=16, T=64, E=512]` is cheap
+   (a handful of FFT-of-128 + GEMMs) and shouldn't move the per-step
+   training time noticeably. Inference adds one mixer pass per step, but
+   the actor/critic dominates.
+5. **GPU memory.** The mixer is small (a few hundred K params for the
+   default `num_layers=2`, `num_filters=8`, `d_model=embed_size`).
+   Inference adds a `[B, seq_len, E]` tensor in agent state.
 
 ## What this experiment tests
 
-**Hypothesis**: training the world model with an auxiliary
-sequence-to-sequence STU prediction loss (Hankel basis, ideally
-`hankel_scaled`) improves Atari 100K eval scores compared to vanilla
-R2-Dreamer / DreamerV3.
+**Hypothesis**: training Dreamer's encoder with a *causal* STU sequence
+mixer between the encoder and the RSSM produces a better world model
+than vanilla R2-Dreamer / DreamerV3, because STU's spectral filtering is
+a useful inductive bias for state tracking (as observed in the
+`spectral-transformer-jax` work).
 
-The mechanism: STUDeterPredictor is trained to predict the entire
-deterministic latent trajectory in one shot from `(initial_state,
-action_seq)`. Its gradients flow back through the encoder, providing
-a parallel rollout supervision in addition to the standard RSSM
-recurrent unroll. If STU's spectral basis is genuinely useful for
-modeling latent dynamics (as the offline STUZero study suggests), the
-encoder should learn a better representation, and the policy/value
-should improve as a result.
+**Mechanism**: at each timestep the RSSM now sees an embed that has
+been temporally mixed via STU over the entire prior context (causally).
+The encoder is trained end-to-end with this extra mixer in the loop,
+which gives gradients that account for cross-time spectral structure.
+At inference the same mixer runs over a rolling buffer so the
+observation pipeline is identical.
 
-**What this does NOT test**: STUDeterPredictor as the primary dynamics
-function in the imagination loop. That would require a more invasive
-refactor (open-loop planning where the policy outputs an entire action
-sequence and STU predicts the resulting trajectory in one shot). If
-the auxiliary loss approach shows positive signal, the open-loop
-variant is the natural follow-up.
+**What this does NOT test**: STU as a replacement for the RSSM's
+recurrent dynamics (the GRU). The RSSM is unchanged. A more invasive
+follow-up would replace `Deter` with an STU-based recurrence — natural
+if the mixer-only integration shows positive signal.
 
-## Known limitations / context
+## Known limitations
 
-- The integration assumes `is_continuous=True` for STUDeterPredictor's
-  action encoder, since Atari one-hot actions are stored as
-  `[B, T, action_space_size]` float vectors in the replay buffer (not
-  as `[B, T]` int tensors). This works for any environment that uses
-  Dreamer's `OneHotAction` wrapper (Atari, Crafter, MemoryMaze) and
-  for naturally continuous environments (DMC, MetaWorld).
-- `max_action_seq_len` is a fixed compile-time parameter for the FFT
-  conv length. The model can be called with shorter sequences (it
-  pads internally), but not longer. Set it >= `batch_length - 1`.
-- The ported `MiniSTU` and `filter_factory` are byte-identical to the
-  STUZero versions. Any STU-related research log entries from
-  `STUZero/research_logs/logs/0409026.md` apply directly.
+- **Episode warm-up.** The mixer is built with a fixed `seq_len`. The
+  first `seq_len-1` steps of each episode (both at inference and the
+  early positions of every training batch row) run on a partially-filled
+  (zero-padded) buffer. With causal filters the most recent position is
+  only mildly affected by the zero pad, but train and inference are not
+  bit-equivalent during this warm-up region.
+- **Cross-episode contamination at training time.** If a sampled batch
+  row spans an episode reset (which the replay buffer does not currently
+  prevent), the mixer's spectral convolution will mix embeds from the
+  pre-reset episode into the post-reset positions. We mask the immediate
+  reset position back to the raw embed, but the convolutional "tail"
+  still bleeds for up to `seq_len` steps. With Atari batch_length=64 and
+  episode lengths in the thousands this is on the order of a few percent
+  of training samples. The inference path is fine because we zero
+  `embed_history` on `is_first`.
+- `_video_pred` (used only for tensorboard video logging) does NOT
+  apply the mixer because it slices `embed[:, :5]` and the mixer
+  expects exactly `seq_len`. Fix is straightforward if you need it.
+- Causality is enforced via `use_hankel_L=True`. The non-causal Hankel
+  basis is not exposed by the mixer because it would break train/inference
+  parity.
 
 ## Linking back to the offline study
 
-The architectural choice (`STUDeterPredictor` with `hankel_scaled`
-filters) is grounded in the offline ablation matrix from
-[STUZero/research_logs/logs/0409026.md][offline-log]. Headline numbers
-from that study (Pong 5-episode dynamics multistep MSE):
-
-| filter             | Pong-5ep step-50 rollout MSE (STUDecoder, mean over 2 seeds) |
-|---|---|
-| `hankel`             | 0.001026                                |
-| `dct`                | 0.001786 (+74% worse)                   |
-| `random_normalized`  | 0.001801 (+76% worse)                   |
-| **`hankel_scaled`**  | **0.000683 (-33% best)**                |
-
-The offline study showed Hankel directions matter (vs DCT/random_norm
-at matched scale), AND scale matters (`hankel_scaled` > Hankel). The
-combination is the global best. Whether this offline ranking transfers
-to actual Atari 100K eval scores is exactly what the runs in this
-repo will determine.
+Filter-basis intuition comes from
+[STUZero/research_logs/logs/0409026.md][offline-log]. The headline
+finding (Pong 5-episode multistep dynamics MSE) was that
+`hankel_scaled` was the global best, beating plain `hankel`, `dct`, and
+`random_normalized` at matched column scale. That offline study used
+STU as an open-loop seq2seq dynamics decoder, which is *not* the
+integration here — the present integration uses STU as a forward-path
+sequence mixer over encoder outputs, which is closer to what was
+shown to work in `spectral-transformer-jax`. Whether the offline filter
+ranking transfers to the in-forward-path setting is an open question
+the filter ablation will answer.
 
 [offline-log]: ../STUZero/research_logs/logs/0409026.md

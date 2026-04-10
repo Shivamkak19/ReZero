@@ -1,0 +1,48 @@
+{
+  "os": "Linux-5.14.0-570.94.1.el9_6.x86_64-x86_64-with-glibc2.34",
+  "python": "CPython 3.11.15",
+  "startedAt": "2026-04-10T05:15:10.328524Z",
+  "args": [
+    "env=atari100k",
+    "env.task=atari_pong",
+    "env.eval_episode_num=10",
+    "model.compile=false",
+    "seed=0",
+    "logdir=/home/sk3686/hazan/ReZero/runs/pong_baseline_seed0"
+  ],
+  "program": "/home/sk3686/hazan/ReZero/train.py",
+  "codePath": "train.py",
+  "codePathLocal": "train.py",
+  "git": {
+    "remote": "https://github.com/Shivamkak19/ReZero.git",
+    "commit": "8f9cdd48837862b7c1787202ab9dfbda1caa4d4b"
+  },
+  "email": "shivamkak9@gmail.com",
+  "root": "/home/sk3686/hazan/ReZero/runs/pong_baseline_seed0",
+  "host": "della-gpu.princeton.edu",
+  "executable": "/home/sk3686/hazan/ReZero/.venv/bin/python",
+  "cpu_count": 128,
+  "cpu_count_logical": 128,
+  "gpu": "NVIDIA A100-PCIE-40GB",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "214374547456",
+      "used": "131601670144"
+    }
+  },
+  "memory": {
+    "total": "810631270400"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA A100-PCIE-40GB",
+      "memoryTotal": "42949672960",
+      "cudaCores": 6912,
+      "architecture": "Ampere",
+      "uuid": "GPU-8b4054a4-c830-20d4-f862-8cb7e6b89915"
+    }
+  ],
+  "cudaVersion": "13.1",
+  "writerId": "4oo4cawepk6i3lcnhdccxc6pq26ta5mq"
+}
