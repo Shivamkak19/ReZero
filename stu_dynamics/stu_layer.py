@@ -107,8 +107,9 @@ class MiniSTU(nn.Module):
         # FFT length
         self.n = nearest_power_of_two(seq_len * 2 - 1, round_up=True)
 
-        # Learnable projections Φ⁺, Φ⁻ : [K, I, O]
-        scale = (num_filters * input_dim) ** -0.5
+        # Learnable projections Φ⁺, Φ⁻ : [K, I, O].
+        # Match JAX STUMixer init: 1/sqrt(branch_dim) rather than 1/sqrt(K*I).
+        scale = input_dim ** -0.5
         self.M_phi_plus = nn.Parameter(
             torch.randn(num_filters, input_dim, output_dim, dtype=dtype, device=self.device) * scale
         )
@@ -116,6 +117,10 @@ class MiniSTU(nn.Module):
             self.M_phi_minus = nn.Parameter(
                 torch.randn(num_filters, input_dim, output_dim, dtype=dtype, device=self.device) * scale
             )
+
+        # Output projection to match JAX STUMixer, which applies a learned
+        # Linear after the spectral mix before returning.
+        self.out_proj = nn.Linear(output_dim, output_dim, bias=False, device=self.device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -135,7 +140,7 @@ class MiniSTU(nn.Module):
         spectral_plus = torch.einsum('blki,kio->blo', U_plus, self.M_phi_plus)
 
         if self.use_hankel_L:
-            return spectral_plus
+            return self.out_proj(spectral_plus)
 
         spectral_minus = torch.einsum('blki,kio->blo', U_minus, self.M_phi_minus)
-        return spectral_plus + spectral_minus
+        return self.out_proj(spectral_plus + spectral_minus)
